@@ -1,6 +1,9 @@
-torch>=2.0.0
-numpy>=1.21.0
-scipy>=1.7.0
-matplotlib>=3.5.0
-pyyaml>=6.0
-osqp>=0.6.2
+# Python 3.8 (CARLA 0.9.13 ships client wheels for cp27/36/37/38 only)
+carla==0.9.13
+numpy<1.25
+scipy<1.11
+casadi>=3.6
+osqp>=1.0
+torch>=2.0        # CUDA build: pip install torch --index-url https://download.pytorch.org/whl/cu121
+matplotlib
+pytest
