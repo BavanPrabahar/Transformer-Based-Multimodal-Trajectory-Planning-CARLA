@@ -1,184 +1,169 @@
-# 🚗 Hybrid Autonomous Trajectory Planning: Transformer-Guided Kinematic MPC
+# Transformer-Guided MPC for Low-Speed Autonomous Driving (CARLA)
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
-[![CARLA](https://img.shields.io/badge/CARLA-0.9.13+-brightgreen.svg)](https://carla.org/)
-[![Status](https://img.shields.io/badge/Status-Active_Development-orange.svg)]()
+Hybrid motion planning for the TiHAN campus vehicle: a **multimodal trajectory transformer** proposes
+candidate paths, a **feasibility/cost selector** rejects unsafe ones, and a **convex LTV-MPC (OSQP)**
+tracks the chosen path with hard actuator limits and linear safety half-planes. It is benchmarked in
+closed loop in **CARLA 0.9.13** against
 
-> A hybrid autonomous vehicle motion planning and control architecture that bridges **Deep Generative Transformers (YOLO-guided)** with **Kinematic Model Predictive Control (MPC)** to overcome the fundamental bottlenecks of classical **MPC-Capsule** obstacle avoidance in dynamic, unstructured environments.
+1. a faithful port of the **lab stack** in `MPC_capsule` (CasADi/IPOPT kinematic MPC + Livox-ROI speed governor), and
+2. a properly built **capsule-constraint NMPC** (non-convex multi-circle collision constraints inside one NLP).
 
----
+> **Branch `dev` is a ground-up rebuild.** Everything reported below is produced by the code in this
+> branch and can be regenerated with `scripts/run_all.sh`. See [What changed vs `main`](#what-changed-vs-main).
 
-## 📌 Executive Summary & Motivation
-
-In current campus and low-speed autonomous electric vehicles, real-time collision avoidance is conventionally handled by **Classical MPC with Geometric Capsule Constraints (`mpc_capsule`)**. 
-
-While mathematically rigorous in static, open environments, the classical `mpc_capsule` method fails in dense, dynamic traffic scenarios due to **non-convex local minima trapping (the "freezing robot" problem)**, **high computational latency**, and **lack of agent intent awareness**.
-
-This project introduces a **two-tier Hybrid Autonomy Architecture**:
-1. **High-Level Intent & Trajectory Proposal (Generative Transformer + YOLO):** Predicts multimodal, human-like future paths conditioned on dynamic scene semantics and the vehicle's past 20 temporal states.
-2. **Low-Level Safety & Dynamics Execution (Kinematic MPC):** Solves a deterministic, convex tracking Quadratic Program (QP) that guarantees physical feasibility, steering rate limits, and zero-collision safety in under **$10\text{ ms}$**.
+<!-- RESULTS -->
 
 ---
 
-## 🔬 Classical MPC-Capsule vs. Proposed Hybrid Architecture
+## Architecture
 
-### 1. The Classical Approach: Geometric Capsule Constraints (`mpc_capsule`)
-
-In the classical formulation, the ego vehicle and all surrounding obstacles are approximated as **capsules** (cylinders with hemispherical ends) or bounding ellipsoids. 
-
-```
-        Obstacle Capsule
-        ┌──────────────┐
-        │  (xo, yo)    │
-        └──────────────┘
-               ▲
-               │  Distance constraint: ||P_ego(k) - P_obs(k)|| >= R_ego + R_obs + d_safe
-               ▼
-        ┌──────────────┐
-        │  Ego Vehicle │
-        └──────────────┘
+```mermaid
+flowchart LR
+    subgraph Perception["Perception (simulated)"]
+        GT[CARLA actors] --> N[40 m range + Gaussian noise<br/>pos, heading, velocity, size]
+    end
+    N --> F[Scene encoder input<br/>ego history · agents · route + drivable bounds · context]
+    F --> T["Trajectory transformer<br/>3-layer encoder, 6 mode queries, 2-layer decoder<br/>→ 6 × 3 s trajectories + scores"]
+    T --> S["Selector<br/>collision (multi-circle, CV prediction) · road bounds · kinematics<br/>cost: −log p + clearance + progress<br/>fallback: slow-down / stop re-timing"]
+    S --> M["Convex LTV-MPC (OSQP)<br/>linearised CoG bicycle, N = 20, 0.1 s<br/>hard |u| limits, L1-relaxed rate limits,<br/>road + obstacle half-planes"]
+    M --> L[Low-level controller<br/>calibrated throttle/brake/steer]
+    L --> V[CARLA vehicle<br/>PhysX dynamics]
 ```
 
-The Non-Linear Model Predictive Control (NMPC) problem is framed as:
+| Component | File | Notes |
+|---|---|---|
+| Lab stack port | [`tmpc/controllers/lab_mpc.py`](tmpc/controllers/lab_mpc.py) | `KinMPCPathFollower` with the deployed tuning (N = 10, DT = 0.4, Q = [300, 300, 100, 10], R = [10, 2000], 0.1 s IPOPT budget, warm start), the 0.8 m/s² reference ramp of `ref_gps_traj.py`, and the Livox ROI guard of `acs1_nav_test7_3.py` (1.3 m half-width corridor, 25 m look-ahead, `v = 40 − 40·exp(−0.04(d − 7))` km/h, emergency brake below 15 m). |
+| Capsule-constraint NMPC | [`tmpc/controllers/capsule_nmpc.py`](tmpc/controllers/capsule_nmpc.py) | Same IPOPT model; ego = 3 circles, obstacles = 1–4 circles each with constant-velocity prediction; hard separation constraints with a heavily penalised slack; drivable-area constraints; shifted warm start. |
+| Convex LTV-MPC | [`tmpc/controllers/ltv_mpc.py`](tmpc/controllers/ltv_mpc.py) | Strictly convex QP: dynamics linearised along the reference, solved by OSQP. |
+| Trajectory transformer | [`tmpc/planning/model.py`](tmpc/planning/model.py) | 1.3 M parameters; typed tokens with padding masks (variable number of agents), learned mode queries with cross-attention, integrated per-step displacements, winner-takes-all loss + mode classification, history dropout against the copycat problem. |
+| Selector | [`tmpc/planning/selector.py`](tmpc/planning/selector.py) | The "feasibility & cost selector" of the original design, now implemented. |
+| Expert (data) | [`tmpc/expert/lattice.py`](tmpc/expert/lattice.py) | Privileged Frenet lattice planner (ground-truth agents) + the same LTV-MPC; per-episode random left/right preference makes the demonstrations genuinely multimodal. |
+| CARLA environment | [`tmpc/sim/carla_env.py`](tmpc/sim/carla_env.py) | Synchronous 20 Hz physics, 10 Hz control, compute latency applied in sim time, noisy perception, Traffic-Manager traffic, scripted parked cars / cones / pedestrians / leaders / oncoming cars. |
 
-$$\min_{u_0, \dots, u_{N-1}} \sum_{k=0}^{N} \Big( \|x_k - x_{\text{ref}, k}\|_Q^2 + \|u_k\|_R^2 + \|\Delta u_k\|_S^2 \Big)$$
+### Simulation realism
 
-$$\text{subject to:} \quad x_{k+1} = f(x_k, u_k) \quad \text{(Kinematic Bicycle Model)}$$
-$$\text{dist}\Big(\text{Capsule}_{\text{ego}}(x_k), \text{Capsule}_{\text{obs}, j}(t_k)\Big) \ge R_{\text{ego}} + R_{\text{obs}, j} + d_{\text{safe}}, \quad \forall j \in \{1, \dots, M\}$$
-$$u_{\min} \le u_k \le u_{\max}, \quad \Delta u_{\min} \le \Delta u_k \le \Delta u_{\max}$$
+* **Vehicle**: CARLA `vehicle.nissan.micra` (wheelbase 2.49 m measured from the wheel positions). The
+  kinematic model, constraints and limits follow the lab controller (`a ∈ [−3, 0.8] m/s²`,
+  `|δ| ≤ 0.75 rad`, jerk/steer-rate limits ±1.5 m/s³ / ±0.75 rad/s).
+* **Actuation**: commands go through a low-level controller whose feed-forward maps were measured on the
+  ego blueprint ([`scripts/calibrate_lowlevel.py`](scripts/calibrate_lowlevel.py),
+  [`results/lowlevel_calibration.json`](results/lowlevel_calibration.json)); CARLA's engine/gearbox lag
+  and strong engine braking are therefore part of the loop.
+* **Latency**: each command is applied only after the controller's measured wall-clock compute time has
+  elapsed in simulation time, so slow solvers pay for it.
+* **Perception**: all evaluated stacks receive the same object list (40 m range; σ = 0.10 m position,
+  0.03 rad heading, 0.15 m/s velocity, 0.05 m size). Only the data-generating expert sees ground truth.
+* **Collisions**: CARLA collision sensor **or** oriented-box overlap with any agent.
 
-#### ❌ Why `mpc_capsule` Breaks Down in Real-World Driving:
-* **Severe Non-Convexity & Local Minima:** The obstacle avoidance constraint creates non-convex "holes" in the feasible state space. When an obstacle directly blocks the centerline, the gradient points outwards equally in opposite directions. Numerical NLP solvers (IPOPT, SQP) get trapped, oscillate, or report solver failure (**the Freezing Robot problem**).
-* **Combinatorial Latency Spikes:** As the number of dynamic obstacles $M$ increases, non-linear constraint evaluations explode ($O(N \cdot M)$). Solver iteration times spike from $15\text{ ms}$ to $>120\text{ ms}$, missing real-time control deadlines.
-* **Semantic Blindness:** A capsule treats a pedestrian, a parked delivery van, and an oncoming bicycle identically—solely as spatial collision hulls. It has no semantic understanding of dynamic agent intent, road rules, or multi-hypothesis behavior.
-* **High-Jerk Reactionary Swerving:** Because classical MPC penalizes deviation from the pre-computed centerline path, the vehicle only swerves at the very last moment when the capsule boundary is violated, leading to uncomfortable, high-jerk maneuvers.
+### Scenarios
+
+| Template | Description |
+|---|---|
+| `blocked` | parked vehicle partially/fully blocking the ego lane |
+| `blocked_oncoming` | blocked lane + oncoming vehicle in the passing lane |
+| `slalom` | two parked vehicles on alternating sides |
+| `cones` | tapered construction-cone closure (optionally a street barrier) |
+| `walker` | pedestrian crossing, triggered by the ego's approach |
+| `leader` | slow lead vehicle (1.8–3 m/s) in the ego lane |
+| `mixed` | blocked lane + crossing pedestrian + 15–35 Traffic-Manager vehicles |
+| `traffic` | route following in background traffic |
+
+Every scenario is fully determined by `(town, template, seed)`, so all controllers face identical
+conditions. Training data comes from **Town01 and Town05**; evaluation uses the **held-out Town02**.
+(Town03 was planned as a third training town, but the CARLA 0.9.13 server on this machine segfaults
+reproducibly while loading it.)
+
+### Learning setup
+
+* **Demonstrations**: the privileged lattice expert drives (35 % of episodes contain steering /
+  acceleration noise bursts so recovery states are visited, cf. ChauffeurNet).
+* **Targets = the expert's plan, not the executed motion.** The transformer replaces the planner,
+  so it is supervised with the 3 s reference the expert hands to the tracker. Plans are reconstructed
+  offline by re-running the deterministic expert on every recorded frame
+  ([`scripts/build_dataset.py`](scripts/build_dataset.py)). Training on executed motion instead
+  taught the model CARLA's ~1 s launch dead time, which the tracker then applied a second time – the
+  car never pulled away from standstill.
+* **DAgger** (one round): the first model drives in the training towns, the expert takes over for 4 s
+  whenever the learner is stuck for 3 s, and every visited state is labelled with the expert's plan.
+* **Loss**: winner-takes-all regression on the closest of 6 modes + cross-entropy on which mode wins;
+  perception-noise augmentation and history dropout.
+Desired speed is 3–5.5 m/s (campus speeds). An episode fails on collision, leaving the drivable area
+for > 1 s, 30 s at standstill ("freeze"), or the time limit.
 
 ---
 
-### 2. The Proposed Solution: Hybrid Transformer-MPC Architecture
+## What changed vs `main`
 
-Instead of forcing a single numerical solver to resolve both **semantic path finding** and **actuator dynamics** simultaneously, we **decouple** the problem into two complementary tiers:
+The `main` branch could not support its claims. Measured problems (details in the commit history):
 
-```
-[ Camera Stream ] ──► [ YOLO 2D/3D Detection ] ──┐
-                                                  ▼
-[ Ego State History ] ──────────────────► [ Context Encoder ]
-  (Last 20 states: x, y, v, theta)                │
-                                                  ▼
-[ Navigation Goal ] ────────────────────► [ Multimodal Trajectory ]
-  (Target Waypoint / Direction)           [    Transformer        ]
-                                                  │
-                                 ┌────────────────┼────────────────┐
-                                 ▼                ▼                ▼
-                            [ Mode 1:       [ Mode 2:        [ Mode 3:
-                             Overtake Left]  Follow / Yield]  Nudge Right ]
-                                 │                │                │
-                                 └────────────────┬────────────────┘
-                                                  ▼
-                                     [ Feasibility & Cost Selector ]
-                                                  │
-                                                  ▼ Optimal Reference Trajectory (x_ref, y_ref)
-                                     [ Kinematic MPC Controller ]
-                                      - Convex Quadratic Program (QP)
-                                      - Steering rate limits (|delta_dot| < 30 deg/s)
-                                      - Vehicle slip & acceleration boundaries
-                                                  │
-                                                  ▼
-                                      [ CAN Bus / Actuators ]
-                                      (Throttle, Steering, Brake)
-```
-
-#### ✅ Key Advantages over `mpc_capsule`:
-| Metric / Feature | Classical `mpc_capsule` | Proposed Hybrid Transformer-MPC |
-| :--- | :--- | :--- |
-| **Optimization Type** | Non-Convex NLP (Hard to solve) | **Convex QP** (Global optimum guaranteed) |
-| **Solving Latency** | $40 - 150\text{ ms}$ (Highly variable) | **$< 12\text{ ms}$** (Deterministic real-time) |
-| **Multimodality** | Unimodal (Fails in ambiguous bottlenecks) | **Multimodal** (Outputs 3 distinct options) |
-| **Obstacle Awareness** | Geometric distance only | **Semantic & Intent-aware** (via YOLO + Attention) |
-| **Motion Smoothness** | Late, high-jerk reactive swerves | **Low-jerk, anticipatory trajectories** |
-| **Failure Mode** | Freezes/stops in front of obstacles | **Proactively selects safe bypass or deceleration** |
+* **The reported numbers were not produced by the code.** Running `benchmark_comparison.py` gave the
+  hybrid **0 %** solver success and **95 ms** mean latency (README: 99.2 % / 7.4 ms), and the capsule
+  baseline **100 %** / 44 ms (README: 68.4 % / 48.2 ms). The benchmark repeated one identical input 20
+  times, so it could only ever report 0 % or 100 %.
+* **The transformer was never trained** (no data, loss or checkpoint); its output was random.
+* **"Convex QP via OSQP"** was actually SciPy SLSQP on the nonlinear bicycle; OSQP was never imported.
+* **No safety mechanism**: the "Feasibility & Cost Selector" did not exist; "Guaranteed Feasible" was a
+  hard-coded string.
+* **No CARLA code** despite the repository name.
+* **The three PDFs in `papers/` were unrelated papers** (two algebraic-geometry papers and an aircraft
+  collision-avoidance paper) – removed; real references are listed below.
+* **The baseline did not describe the lab's stack**: `MPC_capsule` is a path-following kinematic MPC
+  with an external LiDAR speed governor, not an MPC with capsule constraints. Both are now evaluated.
 
 ---
 
-## 🏗️ Repository Architecture
+## Reproduce
+
+```bash
+# Python 3.8 is required by the CARLA 0.9.13 client wheel
+uv venv --python 3.8 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu121
+
+.venv/bin/python -m pytest -q tests          # CARLA-free unit tests (~15 s)
+
+# full pipeline (starts a supervised headless CARLA server if none is running)
+CARLA_ROOT=~/CARLA scripts/run_all.sh 600 10
+```
+
+Individual steps: `scripts/collect_data.py` → `scripts/build_dataset.py` → `scripts/train.py` →
+`scripts/evaluate.py` → `scripts/report.py`. CARLA 0.9.13 occasionally segfaults on map loads;
+[`scripts/carla_server.sh`](scripts/carla_server.sh) restarts it and the collection/evaluation scripts
+reconnect and resume.
+
+## Repository layout
 
 ```text
-Transformer-MPC-Autonomy/
-├── README.md                          # Comprehensive technical design document
-├── requirements.txt                   # Dependencies (PyTorch, OSQP, NumPy, SciPy)
-├── configs/
-│   └── default_params.yaml            # Vehicle parameters, planning horizon, weights
-├── models/
-│   ├── transformer_planner.py         # PyTorch Spatial-Temporal Trajectory Transformer
-│   └── modules/
-│       ├── context_encoder.py         # Encodes past 20 states + YOLO agent tokens
-│       └── trajectory_decoder.py      # Autoregressive multimodal trajectory generator
-├── controllers/
-│   ├── kinematic_mpc.py               # Real-time Convex QP Kinematic Tracking MPC
-│   └── baselines/
-│       └── mpc_capsule_baseline.py    # Classical Non-Linear MPC with capsule constraints
-├── simulation/
-│   ├── carla_data_collector.py        # 10 Hz ego-frame trajectory & obstacle logger
-│   └── carla_environment_runner.py    # CARLA closed-loop evaluation script
-└── benchmark_comparison.py            # Head-to-head simulation: mpc_capsule vs. Hybrid
+tmpc/
+  vehicle.py, geometry.py, types.py
+  controllers/  lab_mpc.py  capsule_nmpc.py  ltv_mpc.py
+  planning/     features.py  model.py  selector.py  safety.py  hybrid.py
+  expert/       lattice.py
+  sim/          carla_env.py  scenarios.py  runner.py  kinematic.py
+scripts/        carla_server.sh  calibrate_lowlevel.py  collect_data.py  build_dataset.py
+                train.py  evaluate.py  report.py  run_all.sh
+tests/          test_core.py
+results/        summary.md  summary.json  figures/  town02/episodes.jsonl
+checkpoints/    planner.pt  planner_history.json
 ```
 
----
+## References
 
-## 🧠 Neural Architecture & Formulation
+* Dosovitskiy et al., *CARLA: An Open Urban Driving Simulator*, CoRL 2017.
+* Kong, Pfeiffer, Schildbach, Borrelli, *Kinematic and Dynamic Vehicle Models for Autonomous Driving Control Design*, IEEE IV 2015.
+* Andersson et al., *CasADi: a software framework for nonlinear optimization and optimal control*, Math. Prog. Comp. 2019.
+* Stellato et al., *OSQP: an operator splitting solver for quadratic programs*, Math. Prog. Comp. 2020.
+* Werling, Ziegler, Kammel, Thrun, *Optimal Trajectory Generation for Dynamic Street Scenarios in a Frenét Frame*, ICRA 2010.
+* Shi, Jiang, Dai, Schiele, *Motion Transformer with Global Intention Localization and Local Movement Refinement*, NeurIPS 2022.
+* Nayakanti et al., *Wayformer: Motion Forecasting via Simple & Efficient Attention Networks*, ICRA 2023.
+* Janner, Li, Levine, *Offline Reinforcement Learning as One Big Sequence Modeling Problem*, NeurIPS 2021.
+* Bansal, Krizhevsky, Ogale, *ChauffeurNet: Learning to Drive by Imitating the Best and Synthesizing the Worst*, RSS 2019.
+* Codevilla, Santana, López, Gaidon, *Exploring the Limitations of Behavior Cloning for Autonomous Driving*, ICCV 2019.
+* Trautman, Krause, *Unfreezing the Robot: Navigation in Dense, Interacting Crowds*, IROS 2010.
+* Zeng, Zhang, Sreenath, *Safety-Critical Model Predictive Control with Discrete-Time Control Barrier Function*, ACC 2021.
 
-### 1. Context Representation ($C$)
-The Transformer conditions on:
-* **Ego History ($X_{\text{past}} \in \mathbb{R}^{20 \times 4}$):** Normalized ego states $(x, y, v, \theta)$ over the last $2.0\text{ s}$ at $10\text{ Hz}$ in the current vehicle coordinate frame ($x=0, y=0, \theta=0$ at $t=0$).
-* **Dynamic Agents ($O_{\text{agents}} \in \mathbb{R}^{M \times 6}$):** Extracted via YOLO detections: relative $(x, y)$, estimated velocity $(v_x, v_y)$, and bounding box extents $(l, w)$.
-* **High-Level Navigation Goal ($g \in \mathbb{R}^2$):** Target coordinate 30–50 meters ahead along the global route.
+## Author & Research Affiliation
 
-### 2. Trajectory Proposal Generation
-The Decoder samples $K=3$ distinct candidate trajectories $\tau^{(m)}$ over a $3.0\text{ s}$ horizon ($T=30$ future timesteps):
-$$\tau^{(m)} = \big[(x_1, y_1, v_1), (x_2, y_2, v_2), \dots, (x_T, y_T, v_T)\big], \quad m \in \{1, 2, 3\}$$
-
-### 3. Convex Tracking Kinematic MPC Formulation
-Once the optimal candidate $\tau^*$ is selected, the Kinematic MPC solves:
-
-$$\min_{u} \sum_{k=0}^{N} \Big( \|x_k - x^*_k\|_{Q}^2 + \|u_k - u^*_k\|_{R}^2 + \|\Delta u_k\|_{S}^2 \Big)$$
-
-$$\text{subject to:} \quad \begin{bmatrix} x_{k+1} \\ y_{k+1} \\ \theta_{k+1} \\ v_{k+1} \end{bmatrix} = \begin{bmatrix} x_k + v_k \cos(\theta_k) \Delta t \\ y_k + v_k \sin(\theta_k) \Delta t \\ \theta_k + \frac{v_k}{L} \tan(\delta_k) \Delta t \\ v_k + a_k \Delta t \end{bmatrix}$$
-$$\delta_{\min} \le \delta_k \le \delta_{\max}, \quad |\delta_{k+1} - \delta_k| \le \dot{\delta}_{\max} \Delta t$$
-$$a_{\min} \le a_k \le a_{\max}$$
-
-Because collision avoidance is handled by the candidate proposal network, this MPC is **strictly convex**, solved via OSQP in **$< 8\text{ ms}$**.
-
----
-
-## 🚀 Quick Start
-
-### 1. Requirements
-Ensure you have Python 3.8+ with PyTorch:
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Run Head-to-Head Comparison Benchmark
-Run the standalone simulation comparing classical `mpc_capsule` against the Hybrid Transformer-MPC:
-```bash
-python benchmark_comparison.py
-```
-
----
-
-## 📈 Initial Experimental Results
-
-| Metric | Classical `mpc_capsule` | Proposed Hybrid Transformer-MPC |
-| :--- | :---: | :---: |
-| **Solver Success Rate (Narrow Corridor)** | 68.4% (Freezes in 31.6% cases) | **99.2%** |
-| **Average Optimization Time** | $48.2\text{ ms}$ | **$7.4\text{ ms}$** |
-| **Worst-Case 99th% Latency** | $142.0\text{ ms}$ | **$11.1\text{ ms}$** |
-| **Mean Lateral Acceleration Jerk** | $2.84\text{ m/s}^3$ | **$0.72\text{ m/s}^3$** (74% smoother) |
-
----
-
-## 👨‍💻 Author & Research Affiliation
 * **Bavan P** — Graduate Student Researcher, Department of Smart Mobility, **IIT Hyderabad / TiHAN National Autonomous Navigation Hub**.
-* **Supervisor:** Director, TiHAN -- IIT Hyderabad
+* **Supervisor:** Director, TiHAN – IIT Hyderabad
 * **GitHub:** [@BavanPrabahar](https://github.com/BavanPrabahar)

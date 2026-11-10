@@ -30,6 +30,7 @@ class SelectorConfig:
     w_progress: float = 1.5
     w_kin: float = 5.0
     w_standoff: float = 15.0
+    w_centre: float = 0.5        # prefer candidates near the lane centre (per m^2)
     slow_factors: tuple = (0.75, 0.5, 0.3)
 
 
@@ -66,10 +67,16 @@ class CandidateSelector:
         ds = np.maximum(refs[:, :, 3] * cfg.dt, 1e-3)
         dyaw = np.abs(np.diff(np.concatenate([np.full((K, 1), obs.ego.yaw), refs[:, :, 2]], 1), axis=1))
         kappa = np.where(refs[:, :, 3] > 0.5, dyaw / ds, 0.0)
-        acc = np.diff(np.concatenate([np.full((K, 1), obs.ego.v), refs[:, :, 3]], 1), axis=1) / cfg.dt
-        kin_excess = np.maximum(kappa - 1.1 * p.max_curvature, 0).max(1) + \
-            np.maximum(acc - (p.a_max + 0.7), 0).max(1) + np.maximum((p.a_min - 1.0) - acc, 0).max(1)
+        # accelerations from a 0.5 s-smoothed speed profile (learned outputs carry cm-level jitter;
+        # the LTV-MPC enforces the actual input limits)
+        vs = np.concatenate([np.full((K, 1), obs.ego.v), refs[:, :, 3]], 1)
+        ker = np.ones(5) / 5
+        vs = np.stack([np.convolve(np.pad(v, 2, mode="edge"), ker, mode="valid") for v in vs])
+        acc = np.diff(vs, axis=1) / cfg.dt
+        kin_excess = np.maximum(kappa - 1.2 * p.max_curvature, 0).max(1) + \
+            np.maximum(acc - (p.a_max + 1.2), 0).max(1) + np.maximum((p.a_min - 1.5) - acc, 0).max(1)
         progress = np.hypot(refs[:, -1, 0] - obs.ego.x, refs[:, -1, 1] - obs.ego.y)
+        self._centre = (d_all.reshape(K, nb) ** 2).mean(1)
         return geo, clear, viol, kin_excess, progress
 
     def select(self, cands_world, logits, obs: Observation) -> Dict:
@@ -85,7 +92,7 @@ class CandidateSelector:
         v_scale = max(obs.v_des * T * cfg.dt, 1.0)
         J = -cfg.w_prob * logp + cfg.w_clear * np.exp(-np.clip(clear, 0, None) / 0.8) + \
             cfg.w_bound * (viol ** 2).sum(1) * cfg.dt - cfg.w_progress * progress / v_scale + cfg.w_kin * kin + \
-            cfg.w_standoff * np.clip(cfg.min_clearance - clear, 0, None) ** 2
+            cfg.w_standoff * np.clip(cfg.min_clearance - clear, 0, None) ** 2 + cfg.w_centre * self._centre
         if feas.any():
             i = int(np.argmin(np.where(feas, J, np.inf)))
             return dict(zref=refs[i], mode=i, fallback=0, clearance=float(geo[i]), n_feasible=int(feas.sum()))

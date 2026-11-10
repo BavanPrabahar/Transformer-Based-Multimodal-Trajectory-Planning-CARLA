@@ -65,13 +65,32 @@ def inputs_from_states(z, dt, p: VehicleParams):
     return np.stack([np.clip(a, p.a_min, p.a_max), np.clip(df, p.df_min, p.df_max)], 1)
 
 
-def reference_from_xy(xy, dt, ego_xy, ego_yaw, ego_v):
-    """(T, 2) world xy at dt spacing -> (T, 4) z_ref [x, y, psi, v]."""
-    yaw, v = heading_and_speed(xy, dt, origin=ego_xy, yaw0=ego_yaw)
-    yaw = ego_yaw + wrap_angle(yaw - ego_yaw)
-    yaw = np.unwrap(np.concatenate([[ego_yaw], yaw]))[1:]
-    # smooth the finite-difference speed a little
-    if len(v) >= 3:
+def reference_from_xy(xy, dt, ego_xy, ego_yaw, ego_v, look=0.4):
+    """(T, 2) world xy at dt spacing -> (T, 4) z_ref [x, y, psi, v].
+
+    Robust to the few-centimetre jitter of learned trajectories near standstill: the heading at
+    step k points to the first later point at least `look` metres away (held when none exists),
+    and the speed is the forward component of the motion (never negative).
+    """
+    xy = np.asarray(xy, float)
+    T = len(xy)
+    pts = np.vstack([np.asarray(ego_xy, float)[None], xy])
+    yaw = np.empty(T)
+    last = ego_yaw
+    for k in range(T):
+        d = np.hypot(*(pts[k + 1:] - pts[k + 1]).T) if k + 1 < T + 1 else np.zeros(0)
+        base = pts[k]
+        dist = np.hypot(*(pts[k + 1:] - base).T)
+        j = np.nonzero(dist >= look)[0]
+        if len(j):
+            v = pts[k + 1 + j[0]] - base
+            last = np.arctan2(v[1], v[0])
+        yaw[k] = last
+    yaw = ego_yaw + np.unwrap(np.concatenate([[0.0], wrap_angle(yaw - ego_yaw)]))[1:]
+    step = np.diff(pts, axis=0)
+    fwd = step[:, 0] * np.cos(yaw) + step[:, 1] * np.sin(yaw)
+    v = np.maximum(fwd, 0.0) / dt
+    if T >= 3:
         v = np.convolve(np.concatenate([[v[0]], v, [v[-1]]]), np.ones(3) / 3, mode="valid")
     return np.column_stack([xy, yaw, v])
 

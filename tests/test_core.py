@@ -181,3 +181,22 @@ def test_selector_rejects_colliding_candidate():
     swerve = np.stack([4.0 * t, 3.4 * (10 * lat ** 3 - 15 * lat ** 4 + 6 * lat ** 5)], 1)
     sel = CandidateSelector(P).select(np.stack([straight, swerve]), np.array([2.0, 0.0]), obs)
     assert sel["mode"] == 1 and sel["fallback"] == 0
+
+
+def test_reference_robust_to_jitter_near_standstill():
+    t = 0.1 * (np.arange(30) + 1)
+    x = np.where(t < 1.0, 0.0, 0.4 * (t - 1.0) ** 2) + np.random.default_rng(1).normal(0, 0.02, 30)
+    ref = reference_from_xy(np.stack([x, np.zeros(30)], 1), 0.1, (0.0, 0.0), 0.0, 0.0)
+    assert np.all(np.abs(ref[:, 2]) < 0.2)          # heading never flips backwards
+    assert np.all(ref[:, 3] >= 0.0)                 # forward-only speed
+
+
+def test_dead_time_compensation_advances_launch():
+    from tmpc.planning.hybrid import HybridController
+    t = 0.1 * (np.arange(30) + 1)
+    x = np.where(t < 1.0, 0.0, 0.4 * (t - 1.0) ** 2)
+    stay = np.zeros((30, 2))
+    out = HybridController.compensate_dead_time(np.stack([np.stack([x, np.zeros(30)], 1), stay]), (0.0, 0.0))
+    first = np.nonzero(out[0, :, 0] > 0.15)[0][0]
+    orig = np.nonzero(x > 0.15)[0][0]
+    assert first == orig - 10 and np.allclose(out[1], 0.0)   # advanced by the 1 s cap; a stop is kept

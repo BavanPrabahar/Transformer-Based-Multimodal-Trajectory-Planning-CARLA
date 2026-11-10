@@ -22,10 +22,41 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tmpc.geometry import Path, to_local  # noqa: E402
+from tmpc.expert.lattice import LatticeConfig, LatticePlanner  # noqa: E402
+from tmpc.geometry import Path, agents_from_array, to_local  # noqa: E402
 from tmpc.planning.features import FeatureConfig, build_features  # noqa: E402
+from tmpc.types import EgoState, Observation  # noqa: E402
+from tmpc.vehicle import VehicleParams  # noqa: E402
 
 CFG = FeatureConfig()
+
+
+def expert_config(seed):
+    """Re-create the per-episode expert settings drawn in collect_data.py."""
+    rng = np.random.default_rng(seed + 5)
+    side = float(rng.choice([-1.0, 1.0]) * rng.uniform(0.2, 0.6))
+    return LatticeConfig(side_pref=side, w_opp=float(rng.uniform(1.0, 2.0)), w_clear=float(rng.uniform(3.0, 5.0)))
+
+
+def reconstruct_plans(rec, route, seed):
+    """Re-run the (deterministic) privileged lattice planner on every recorded frame.
+
+    The transformer replaces the planner, so its supervision is the planner's output (the
+    reference the tracker follows) rather than the executed motion, which also contains the
+    actuator lag (~1 s at launch in CARLA) that the tracker re-introduces anyway."""
+    pr = rec["params"]
+    params = VehicleParams().with_geometry(*[float(v) for v in pr])
+    planner = LatticePlanner(params, expert_config(seed))
+    ego = rec["ego"]
+    plans = np.zeros((len(ego), CFG.future_steps, 2), np.float32)
+    v_des = float(rec["v_des"])
+    for i in range(len(ego)):
+        e = EgoState(*[float(v) for v in ego[i, :6]])
+        obs = Observation(float(rec["t"][i]), e, agents_from_array(rec["agents"][i]), route, v_des,
+                          ego[max(0, i - 10):i + 1, :4], float(rec["s"][i]), float(rec["d"][i]))
+        zref, _ = planner.plan(obs)
+        plans[i] = zref[:CFG.future_steps, :2]
+    return plans
 
 
 def valid_range(rec, status):
@@ -45,7 +76,7 @@ def valid_range(rec, status):
 
 
 def process(args):
-    path, status, stride = args
+    path, status, stride, target_mode, seed = args
     try:
         rec = dict(np.load(path, allow_pickle=False))
     except Exception as ex:
@@ -53,16 +84,41 @@ def process(args):
     route = Path(rec["route_xy"], rec["route_dl"], rec["route_dr"], rec["route_lw"])
     ego = rec["ego"]
     T = CFG.future_steps
-    start, end = valid_range(rec, status)
-    pert = rec["perturbed"].astype(bool)
+    dagger = "label" in rec
+    if not dagger and target_mode == "plan":
+        rec["label"] = reconstruct_plans(rec, route, seed)
+        start0, end0 = valid_range(rec, status)
+    if "label" in rec and not dagger:
+        # expert-driven episode with reconstructed plans: perturbed frames are valid recovery labels
+        start, end = start0, end0
+        pert = np.zeros(len(ego), bool)
+        dagger = True
+    elif dagger:
+        # learner-driven episode labelled by the expert: every visited state is useful, but cap
+        # long standstills so frozen segments do not flood the data
+        v = ego[:, 3]
+        still = np.convolve((v < 0.2).astype(float), np.ones(30), mode="same") >= 30
+        keep = ~still | (np.cumsum(still) % 5 == 0)
+        start, end = 0, len(ego)
+        pert = ~keep
+        T_lab = 0
+    else:
+        start, end = valid_range(rec, status)
+        pert = rec["perturbed"].astype(bool)
     out = {k: [] for k in ["hist", "agents", "agents_mask", "route", "route_mask", "ctx", "target"]}
     v_des = float(rec["v_des"])
-    for i in range(start, end - T, stride):
-        if pert[i:i + T].any():
-            continue
-        fut = ego[i + 1:i + T + 1]
-        if len(fut) < T:
-            break
+    last = end if dagger else end - T
+    for i in range(start, last, stride):
+        if dagger:
+            if pert[i]:
+                continue
+            fut = rec["label"][i]
+        else:
+            if pert[i:i + T].any():
+                continue
+            fut = ego[i + 1:i + T + 1]
+            if len(fut) < T:
+                break
         f = build_features(ego[i, :3], ego[i, 3], ego[i, 4], ego[i, 5], ego[max(0, i - CFG.hist_len + 1):i + 1, :4],
                            rec["agents"][i], route, float(rec["s"][i]), v_des, CFG)
         tgt = to_local(fut[:, :2], ego[i, 0], ego[i, 1], ego[i, 2]).astype(np.float32)
@@ -81,12 +137,14 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--target", choices=["plan", "executed"], default="plan",
+                    help="supervise with the expert's plan (default) or the executed motion")
     args = ap.parse_args()
     jobs, meta = [], []
     for d in args.data:
         with open(os.path.join(d, "index.csv")) as f:
             for r in csv.DictReader(f):
-                jobs.append((os.path.join(d, r["file"]), r["status"], args.stride))
+                jobs.append((os.path.join(d, r["file"]), r["status"], args.stride, args.target, int(r["seed"])))
                 meta.append(r)
     print(f"{len(jobs)} episodes; statuses:", {s: sum(m['status'] == s for m in meta) for s in set(m['status'] for m in meta)})
     with Pool(args.workers) as pool:

@@ -43,9 +43,29 @@ class HybridController(Controller):
         world = to_global(traj, e.x, e.y, e.yaw)
         return world, logits
 
+    @staticmethod
+    def compensate_dead_time(world, ego_xy, max_shift=10, moved=0.15):
+        """Remove the launch dead time learned from CARLA's actuator lag.
+
+        Demonstrations starting from standstill contain ~1 s of no motion (gear engagement); when
+        tracked, that pause would be applied twice and the car never launches.  Near standstill,
+        each candidate's timing is advanced to its first motion (path unchanged, <= 1 s)."""
+        out = world.copy()
+        for i, c in enumerate(world):
+            dist = np.hypot(c[:, 0] - ego_xy[0], c[:, 1] - ego_xy[1])
+            k = np.nonzero(dist > moved)[0]
+            if not len(k) or k[0] == 0:
+                continue
+            sh = int(min(k[0], max_shift))
+            tail = c[-1] + (np.arange(1, sh + 1)[:, None]) * (c[-1] - c[-2])
+            out[i] = np.vstack([c[sh:], tail])
+        return out
+
     def step(self, obs: Observation) -> Command:
         t0 = time.perf_counter()
         world, logits = self.predict(obs)
+        if obs.ego.v < 0.5:
+            world = self.compensate_dead_time(world, (obs.ego.x, obs.ego.y))
         t_nn = time.perf_counter() - t0
         if self.use_selector:
             sel = self.selector.select(world, logits, obs)

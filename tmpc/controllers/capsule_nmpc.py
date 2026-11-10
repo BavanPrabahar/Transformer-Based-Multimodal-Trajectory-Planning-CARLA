@@ -36,15 +36,17 @@ class CapsuleNMPC(Controller):
         self.max_obs = max_obstacles
         self.cpo = circles_per_obstacle
         self.range = horizon_range
+        # road bounds are weighted like the obstacle constraints: leaving the road is not a cheap escape
         self.mpc = KinMPCPathFollower(params, N=N, DT=DT, Q=Q, R=R, max_cpu_time=max_cpu_time,
                                       n_obs_circles=max_obstacles * circles_per_obstacle,
-                                      road_bounds=True, d_safe=d_safe)
+                                      road_bounds=True, d_safe=d_safe, road_slack_weight=(1e4, 1e5))
         self.N, self.DT = N, DT
 
     def reset(self, route, v_des, ego: EgoState):
         self.route, self.v_des = route, v_des
         self.acc_prev, self.df_prev = 0.0, 0.0
         self.ws = None
+        self.fails = 0
 
     # ------------------------------------------------------------------------------
     def _reference(self, e: EgoState, s_ego):
@@ -123,9 +125,23 @@ class CapsuleNMPC(Controller):
             z, u, sl = self.ws
             m.warm_start(np.vstack([z[1:], z[-1:]]), np.vstack([u[1:], u[-1:]]), np.vstack([sl[1:], sl[-1:]]))
         sol = m.solve()
-        self.ws = (sol["z_mpc"], sol["u_mpc"], sol["sl_mpc"])
-        a, df = float(sol["u_control"][0]), float(sol["u_control"][1])
+        if sol["optimal"] or self.ws is None:
+            self.fails = 0
+            self.ws = (sol["z_mpc"], sol["u_mpc"], sol["sl_mpc"])
+            plan = sol["z_mpc"]
+            a, df = float(sol["u_control"][0]), float(sol["u_control"][1])
+        else:
+            # IPOPT did not converge within the real-time budget: never execute an unconverged
+            # iterate; follow the shifted previous accepted plan, and brake if failures persist.
+            self.fails += 1
+            z, u, sl = self.ws
+            z, u, sl = np.vstack([z[1:], z[-1:]]), np.vstack([u[1:], u[-1:]]), np.vstack([sl[1:], sl[-1:]])
+            self.ws = (z, u, sl)
+            plan = z
+            a, df = float(u[0, 0]), float(u[0, 1])
+            if self.fails > 5:
+                a = min(a, -1.5)
         self.acc_prev, self.df_prev = a, df
-        return Command(a, df, time.perf_counter() - t0, bool(sol["optimal"]), sol["z_mpc"][:, :2],
+        return Command(a, df, time.perf_counter() - t0, bool(sol["optimal"]), plan[:, :2],
                        dict(solver_time=sol["solve_time"], obs_slack=float(np.max(sol["sl_obs"])),
-                            n_obstacles=len(agents)))
+                            n_obstacles=len(agents), fallback=not sol["optimal"]))

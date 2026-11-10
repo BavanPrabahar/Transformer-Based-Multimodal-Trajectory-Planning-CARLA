@@ -144,6 +144,7 @@ class Scripted:
 class CarlaEnv:
     def __init__(self, host="localhost", port=2000, tm_port=8000, dt=0.05, control_every=2,
                  no_rendering=True, timeout=60.0, history_len=11, sim_latency=True):
+        self.host, self.port, self.timeout = host, port, timeout
         self.client = carla.Client(host, port)
         self.client.set_timeout(timeout)
         self.tm_port = tm_port
@@ -165,9 +166,15 @@ class CarlaEnv:
     def load_town(self, town):
         cur = self.world.get_map().name.split("/")[-1]
         if cur != town:
-            self._set_sync(False)
-            self.world = self.client.load_world(town)
-            time.sleep(1.0)
+            if not cur.startswith("Town10HD"):
+                # CARLA 0.9.13 here segfaults on the 2nd map load of a server process: restart the
+                # server (scripts/carla_server.sh brings it back) so every load is a first load.
+                self._restart_server()
+                cur = self.world.get_map().name.split("/")[-1]
+            if cur != town:
+                self._set_sync(False)
+                self.world = self.client.load_world(town)
+                time.sleep(1.0)
         self.town = town
         self.map = self.world.get_map()
         self._set_sync(True)
@@ -176,6 +183,23 @@ class CarlaEnv:
         self.tm = self.client.get_trafficmanager(self.tm_port)
         self.tm.set_synchronous_mode(True)
         self.spawn_points = self.map.get_spawn_points()
+
+    def _restart_server(self, timeout=180.0):
+        import subprocess
+        port = self.port
+        subprocess.run(["pkill", "-9", "-f", f"CarlaUE4-Linux-Shipping.*-carla-rpc-port={port}"], check=False)
+        time.sleep(10.0)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                self.client = carla.Client(self.host, port)
+                self.client.set_timeout(10.0)
+                self.world = self.client.get_world()
+                self.client.set_timeout(self.timeout)
+                return
+            except RuntimeError:
+                time.sleep(3.0)
+        raise RuntimeError(f"CARLA on port {port} did not come back")
 
     def _destroy_leftovers(self):
         """Remove actors left behind by crashed/killed clients (they are invisible to us

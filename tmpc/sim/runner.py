@@ -34,14 +34,18 @@ def episode_time_limit(spec: ScenarioSpec, route_length: float) -> float:
 
 def run_carla_episode(env, ctrl: Controller, spec: ScenarioSpec, privileged=False, record=False,
                       perturb_prob=0.0, rng: Optional[np.random.Generator] = None, verbose=False,
-                      freeze_limit: float = 30.0) -> Dict:
+                      freeze_limit: float = 30.0, labeler=None) -> Dict:
     """freeze_limit: stop the episode (status 'timeout', freeze=True) after this many seconds
-    at standstill - the 'freezing robot' failure mode."""
+    at standstill - the 'freezing robot' failure mode.
+    labeler: optional callable(privileged_obs) -> (T, 2) world xy; recorded per step as 'label'
+    (DAgger: the learner drives, the privileged expert labels the states it visits)."""
     obs = env.reset(spec)
     if privileged:
         obs = env.observe(privileged=True)
     route = env.route
     ctrl.reset(route, spec.v_des, obs.ego)
+    if labeler is not None and hasattr(labeler, "reset"):
+        labeler.reset()
     t_max = episode_time_limit(spec, route.length)
     rng = rng or np.random.default_rng(spec.seed + 99)
     # noise-injection bursts (for recovery data); never in evaluation
@@ -81,6 +85,9 @@ def run_carla_episode(env, ctrl: Controller, spec: ScenarioSpec, privileged=Fals
             rec["solve"].append(cmd.solve_time)
             rec["ok"].append(cmd.ok)
             rec["fallback"].append(bool(cmd.info.get("fallback", False)))
+            if labeler is not None:
+                from dataclasses import replace as _replace
+                rec.setdefault("label", []).append(labeler(_replace(obs, agents=env.last_gt)))
         obs, info = env.step(cmd, perturb=pert)
         if privileged:
             obs = env.observe(privileged=True)

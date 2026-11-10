@@ -120,7 +120,7 @@ def save_checkpoint(path, model, feat_cfg: FeatureConfig, extra=None):
 
 
 def load_checkpoint(path, device="cpu"):
-    ck = torch.load(path, map_location=device)
+    ck = torch.load(path, map_location=device, weights_only=True)
     model = TrajectoryTransformer(ModelConfig(**ck["model_cfg"]))
     model.load_state_dict(ck["state_dict"])
     model.eval().to(device)
