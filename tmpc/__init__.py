@@ -1,4 +1,4 @@
-"""Transformer-guided MPC for low-speed autonomous driving (TiHAN campus vehicle).
+"""Transformer-guided MPC for low-speed autonomous driving (low-speed campus vehicle).
 
 Sub-packages
 ------------

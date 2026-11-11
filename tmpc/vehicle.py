@@ -1,7 +1,7 @@
 """Vehicle parameters and the kinematic bicycle model.
 
-Defaults are taken from the TiHAN lab controller
-(`MPC_capsule/src/tihan_mpc/scripts/controllers/kinematic_mpc.py`, class
+Defaults are taken from the MPC_capsule controller
+(`controllers/kinematic_mpc.py`, class
 KinMPCPathFollower): CoG-referenced kinematic bicycle with slip angle beta,
 L_F = 1.20 m, L_R = 0.90 m and the same actuator/rate limits.  `from_carla`
 re-derives the geometry from the simulated vehicle so that every controller

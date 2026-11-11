@@ -1,6 +1,6 @@
 # Transformer-Guided MPC for Low-Speed Autonomous Driving (CARLA)
 
-Hybrid motion planning for the TiHAN campus vehicle: a **multimodal trajectory transformer** proposes
+Hybrid motion planning for a low-speed campus vehicle: a **multimodal trajectory transformer** proposes
 candidate 3 s trajectories and a **convex LTV-MPC (OSQP)** tracks the top-ranked one with hard actuator
 limits and linear obstacle/road half-planes. (An optional feasibility/cost selector between the two
 turned out to be counter-productive – see the ablation.) It is benchmarked in closed loop in
@@ -9,6 +9,9 @@ turned out to be counter-productive – see the ablation.) It is benchmarked in 
 1. a faithful port of the **lab stack** in `MPC_capsule` (CasADi/IPOPT kinematic MPC + Livox-ROI speed governor), and
 2. a properly built **capsule-constraint NMPC** (non-convex multi-circle collision constraints inside one NLP).
 
+> **Personal hobby project.** It is not an official project of, or endorsed by, any university, lab or
+> organisation.
+>
 > **This is a ground-up rebuild of the initial version.** Everything reported below is produced by the
 > code in this repository and can be regenerated with `scripts/run_all.sh`. See
 > [Changes from the initial version](#changes-from-the-initial-version).
@@ -261,8 +264,7 @@ checkpoints/    planner.pt  planner_history.json
 * Trautman, Krause, *Unfreezing the Robot: Navigation in Dense, Interacting Crowds*, IROS 2010.
 * Zeng, Zhang, Sreenath, *Safety-Critical Model Predictive Control with Discrete-Time Control Barrier Function*, ACC 2021.
 
-## Author & Research Affiliation
+## Author
 
-* **Bavan P** — Graduate Student Researcher, Department of Smart Mobility, **IIT Hyderabad / TiHAN National Autonomous Navigation Hub**.
-* **Supervisor:** Director, TiHAN – IIT Hyderabad
+* **Bavan P** — personal hobby project.
 * **GitHub:** [@BavanPrabahar](https://github.com/BavanPrabahar)

@@ -1,6 +1,6 @@
-"""Faithful port of the TiHAN lab stack ("MPC_capsule").
+"""Faithful port of the "MPC_capsule" controller stack.
 
-Components reproduced from ~/tihan/MPC_capsule/src/tihan_mpc/scripts:
+Components reproduced from the MPC_capsule ROS package scripts:
 
 * KinMPCPathFollower (controllers/kinematic_mpc.py): CasADi/IPOPT nonlinear
   kinematic MPC on the CoG bicycle with slip angle, hard input bounds, input-rate
