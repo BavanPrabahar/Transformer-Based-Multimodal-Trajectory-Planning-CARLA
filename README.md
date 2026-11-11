@@ -9,8 +9,9 @@ turned out to be counter-productive – see the ablation.) It is benchmarked in 
 1. a faithful port of the **lab stack** in `MPC_capsule` (CasADi/IPOPT kinematic MPC + Livox-ROI speed governor), and
 2. a properly built **capsule-constraint NMPC** (non-convex multi-circle collision constraints inside one NLP).
 
-> **Branch `dev` is a ground-up rebuild.** Everything reported below is produced by the code in this
-> branch and can be regenerated with `scripts/run_all.sh`. See [What changed vs `main`](#what-changed-vs-main).
+> **This is a ground-up rebuild of the initial version.** Everything reported below is produced by the
+> code in this repository and can be regenerated with `scripts/run_all.sh`. See
+> [Changes from the initial version](#changes-from-the-initial-version).
 
 ## Results (held-out CARLA Town02, 80 paired scenarios)
 
@@ -189,9 +190,10 @@ for > 1 s, 30 s at standstill ("freeze"), or the time limit.
 
 ---
 
-## What changed vs `main`
+## Changes from the initial version
 
-The `main` branch could not support its claims. Measured problems (details in the commit history):
+The initial version (commit `71341a2`) reported results its code could not reproduce. Its files have
+been removed; the problems found when it was run:
 
 * **The reported numbers were not produced by the code.** Running `benchmark_comparison.py` gave the
   hybrid **0 %** solver success and **95 ms** mean latency (README: 99.2 % / 7.4 ms), and the capsule
