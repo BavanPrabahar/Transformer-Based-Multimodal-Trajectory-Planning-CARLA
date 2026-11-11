@@ -1,9 +1,10 @@
 # Transformer-Guided MPC for Low-Speed Autonomous Driving (CARLA)
 
 Hybrid motion planning for the TiHAN campus vehicle: a **multimodal trajectory transformer** proposes
-candidate paths, a **feasibility/cost selector** rejects unsafe ones, and a **convex LTV-MPC (OSQP)**
-tracks the chosen path with hard actuator limits and linear safety half-planes. It is benchmarked in
-closed loop in **CARLA 0.9.13** against
+candidate 3 s trajectories and a **convex LTV-MPC (OSQP)** tracks the top-ranked one with hard actuator
+limits and linear obstacle/road half-planes. (An optional feasibility/cost selector between the two
+turned out to be counter-productive – see the ablation.) It is benchmarked in closed loop in
+**CARLA 0.9.13** against
 
 1. a faithful port of the **lab stack** in `MPC_capsule` (CasADi/IPOPT kinematic MPC + Livox-ROI speed governor), and
 2. a properly built **capsule-constraint NMPC** (non-convex multi-circle collision constraints inside one NLP).
@@ -11,7 +12,103 @@ closed loop in **CARLA 0.9.13** against
 > **Branch `dev` is a ground-up rebuild.** Everything reported below is produced by the code in this
 > branch and can be regenerated with `scripts/run_all.sh`. See [What changed vs `main`](#what-changed-vs-main).
 
-<!-- RESULTS -->
+## Results (held-out CARLA Town02, 80 paired scenarios)
+
+Every controller drove the **same 80 scenarios** (10 per template, unseen town, noisy perception,
+compute latency applied in simulation).
+
+| Controller | Success (95 % CI) | Collision | Freeze / timeout | Route progress | Compute mean / p99 (ms) |
+|---|---|---|---|---|---|
+| Lab MPC stack (faithful `MPC_capsule` port) | 31 % (22–42) | 2 % | 66 % | 55 % | 8.1 / 26 |
+| Capsule-constraint NMPC | 29 % (20–39) | 8 % | 64 % | 52 % | 76.9 / 114 |
+| Transformer + selector + LTV-MPC (as designed) | 48 % (37–58) | 2 % | 50 % | 67 % | 11.9 / 22 |
+| **Transformer top-1 + safety LTV-MPC (recommended)** | **71 % (61–80)** | **2 %** | 26 % | 83 % | **8.4 / 16** |
+| Privileged lattice expert (oracle, ground-truth agents) | 76 % (66–84) | 2 % | 21 % | 87 % | 19.2 / 26 |
+
+![Closed-loop outcomes](results/figures/outcomes.png)
+
+![Success by scenario template](results/figures/success_by_template.png)
+
+**What the numbers say**
+
+* **The lab stack cannot get past an obstacle by design.** It follows the route and stops for anything
+  inside its 1.3 m corridor, so it scores 0 % on every blocked-lane template, but it is the best
+  controller for following a slow leader (100 %) and very good with crossing pedestrians (80 %).
+* **The capsule-constraint NMPC exhibits the "freezing robot" problem** the original README described,
+  now measured instead of asserted: it stalls in front of obstacles (local minima of the non-convex
+  NLP – this persists even with a 20× larger IPOPT budget in the kinematic simulator), its IPOPT solves
+  exceed the 100 ms control period at p99, and when IPOPT does not converge it has to fall back to its
+  previous plan. It has the most collisions (8 %), but also the smoothest ride when it works.
+* **The learned hybrid passes obstacles, pedestrians and traffic.** Top-1 + safety LTV-MPC succeeds
+  in 71 % of scenarios (vs 31 % / 29 %), close to the privileged expert it imitates (76 %) although it
+  only sees noisy perception, and with the lowest worst-case compute time of all stacks (p99 16 ms).
+* **The candidate selector, as designed, hurts (48 %).** Its hard clearance margin on the
+  (already conservative) circle cover rejects valid squeeze-past manoeuvres; it then falls back to
+  slowing/stopping and the car freezes. The ablation found this on Town02; it was then confirmed on
+  fresh **Town01 validation scenarios** (below), where a softened selector did not close the gap.
+  Hence the recommendation: let the transformer's top-ranked trajectory drive and rely on the convex
+  MPC's safety half-planes.
+* **The safety half-planes matter**: removing them drops success to 46 % (same collision rate,
+  more freezes).
+
+### Ablations and validation
+
+| Variant (Town02, 80 paired scenarios) | Success | Collision | Freeze |
+|---|---|---|---|
+| Transformer + selector + LTV-MPC (as designed) | 48 % | 2 % | 50 % |
+| Top-1 + safety LTV-MPC (no selector) | **71 %** | 2 % | 26 % |
+| Selector, LTV-MPC **without** safety half-planes | 46 % | 2 % | 51 % |
+
+| Variant (Town01 validation, 24 fresh scenarios) | Success | Collision |
+|---|---|---|
+| Transformer + selector + LTV-MPC (as designed) | 11 / 24 | 1 |
+| Soft selector (hard-reject only overlap, expert-style dead-lock relaxation) | 12 / 24 | 1 |
+| **Top-1 + safety LTV-MPC** | **18 / 24** | **0** |
+
+### Compute and comfort
+
+![Compute latency](results/figures/latency.png)
+
+![Ride comfort](results/figures/comfort.png)
+
+Latency is wall-clock Python on a laptop CPU with two CARLA servers running, and it is fed back into
+the simulation (a slow solve delays its command). Relative ordering is more meaningful than the
+absolute values; a compiled NMPC (e.g. acados) would narrow the capsule NMPC's gap.
+
+### Training
+
+* **Data**: 499 expert episodes (Town01: 250, Town05: 249) + 150 DAgger episodes → 137.5 k training
+  and 13.9 k validation samples (episode-level split), 3 s horizon at 10 Hz.
+* **Model**: 1.30 M parameters, 40 epochs on an RTX 4050 (~16 min).
+* **Validation (held-out episodes)**: minADE₆ 0.128 m, minFDE₆ 0.242 m, top-1 ADE 0.269 m,
+  top-1 FDE 0.607 m, miss rate (minFDE > 2 m) 0.8 %.
+
+![Training curves](results/figures/training.png)
+
+Full tables (including time-to-goal, minimum gap, jerk, lateral acceleration, per-template rates):
+[`results/summary.md`](results/summary.md); raw per-episode records: `results/town02*/episodes.jsonl`.
+
+### Limitations
+
+* **Simulation only.** The ego is a CARLA Nissan Micra with the lab controller's limits, not the
+  Capsule vehicle; nothing here has been run on the real car or on real sensor data yet.
+* **Perception is an object list with Gaussian noise** – no occlusions, missed detections or tracking
+  failures. Real Livox/YOLO perception will be harder.
+* **Statistics**: 80 scenarios give ±10-point confidence intervals. The hybrid's advantage over both
+  baselines is significant; the gap to the expert is not.
+* **Selection on the test town**: the recommended configuration was identified by an ablation on
+  Town02 (and then confirmed on Town01 validation), so its Town02 figure is mildly optimistic.
+* **The expert is the ceiling.** It fails 24 % of held-out scenarios (mostly freezes), and the
+  imitator inherits its behaviour. Town03 could not be used (server crash on load).
+
+### Next steps
+
+1. ROS node: run the trained planner + LTV-MPC inside `MPC_capsule` (it publishes the same
+   acceleration/steering commands as `mpc_cmd_pub.py`) and test on recorded rosbags.
+2. Replace the object-list perception with the vehicle's Livox clustering / YOLO + tracking output.
+3. More DAgger rounds and a stronger expert (it is the ceiling); report multiple seeds.
+4. Compiled solvers (acados / C++) for a latency comparison that is not dominated by Python.
+
 
 ---
 
@@ -36,7 +133,7 @@ flowchart LR
 | Capsule-constraint NMPC | [`tmpc/controllers/capsule_nmpc.py`](tmpc/controllers/capsule_nmpc.py) | Same IPOPT model; ego = 3 circles, obstacles = 1–4 circles each with constant-velocity prediction; hard separation constraints with a heavily penalised slack; drivable-area constraints; shifted warm start. |
 | Convex LTV-MPC | [`tmpc/controllers/ltv_mpc.py`](tmpc/controllers/ltv_mpc.py) | Strictly convex QP: dynamics linearised along the reference, solved by OSQP. |
 | Trajectory transformer | [`tmpc/planning/model.py`](tmpc/planning/model.py) | 1.3 M parameters; typed tokens with padding masks (variable number of agents), learned mode queries with cross-attention, integrated per-step displacements, winner-takes-all loss + mode classification, history dropout against the copycat problem. |
-| Selector | [`tmpc/planning/selector.py`](tmpc/planning/selector.py) | The "feasibility & cost selector" of the original design, now implemented. |
+| Selector (optional) | [`tmpc/planning/selector.py`](tmpc/planning/selector.py) | The "feasibility & cost selector" of the original design, implemented and evaluated; the recommended configuration bypasses it (`HybridController(..., use_selector=False)`, controller name `hybrid_noselector`). |
 | Expert (data) | [`tmpc/expert/lattice.py`](tmpc/expert/lattice.py) | Privileged Frenet lattice planner (ground-truth agents) + the same LTV-MPC; per-episode random left/right preference makes the demonstrations genuinely multimodal. |
 | CARLA environment | [`tmpc/sim/carla_env.py`](tmpc/sim/carla_env.py) | Synchronous 20 Hz physics, 10 Hz control, compute latency applied in sim time, noisy perception, Traffic-Manager traffic, scripted parked cars / cones / pedestrians / leaders / oncoming cars. |
 

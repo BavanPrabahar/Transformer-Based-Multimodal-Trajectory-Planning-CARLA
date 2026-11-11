@@ -11,6 +11,7 @@ from collections import OrderedDict
 import numpy as np
 
 import matplotlib
+import matplotlib.ticker
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -22,10 +23,12 @@ STATUS = OrderedDict(success=("#0ca30c", "#ffffff", "Success"), freeze=("#fab219
                      offroad=("#ec835a", "#0b0b0b", "Off-road"), collision=("#d03b3b", "#ffffff", "Collision"))
 SEQ = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf",
        "#1c5cab", "#184f95", "#104281", "#0d366b"]
-ORDER = ["lab_mpc", "capsule_nmpc", "hybrid", "expert", "hybrid_noselector", "hybrid_nosafety", "hybrid_top1"]
+ORDER = ["lab_mpc", "capsule_nmpc", "hybrid", "expert", "hybrid_soft", "hybrid_noselector", "hybrid_nosafety",
+         "hybrid_top1"]
 LABEL = {"lab_mpc": "Lab MPC stack (MPC_capsule)", "capsule_nmpc": "Capsule-constraint NMPC",
-         "hybrid": "Transformer + selector + LTV-MPC", "expert": "Privileged lattice expert (oracle)",
-         "hybrid_noselector": "Hybrid w/o selector", "hybrid_nosafety": "Hybrid w/o safety half-planes",
+         "hybrid": "Transformer + selector + LTV-MPC (as designed)", "expert": "Privileged lattice expert (oracle)",
+         "hybrid_soft": "Hybrid, soft selector (revised)",
+         "hybrid_noselector": "Transformer top-1 + safety LTV-MPC (recommended)", "hybrid_nosafety": "Hybrid w/o safety half-planes",
          "hybrid_top1": "Transformer top-1 + plain tracking"}
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10, "axes.edgecolor": AXIS, "axes.labelcolor": INK2,
@@ -180,19 +183,25 @@ def fig_latency(rows, ctrls, path):
         ax.scatter(p99, yi + rng.uniform(-0.16, 0.16, len(p99)), s=14, color=col, alpha=0.55, linewidths=0,
                    label=None)
         ax.plot([np.median(mean)] * 2, [yi - 0.3, yi + 0.3], color=INK, linewidth=2)
-        ax.text(max(p99.max(), 1) * 1.08, yi, f"median p99 {np.median(p99):.0f} ms", va="center", fontsize=8,
-                color=INK2)
+        ax.text(1.01, yi, f"median p99 {np.median(p99):.0f} ms", va="center", fontsize=8, color=INK2,
+                transform=ax.get_yaxis_transform())
     ax.axvline(100, color=MUTED, linewidth=1, linestyle=(0, (3, 3)))
     ax.text(100, y.max() + 0.55, "100 ms = one control period", fontsize=8, color=MUTED, ha="center")
     ax.set_xscale("log")
+    ticks = [5, 10, 20, 50, 100, 200, 500]
+    lo, hi = ax.get_xlim()
+    ax.set_xticks([t for t in ticks if lo <= t <= hi * 1.5])
+    ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     ax.set_yticks(y)
     ax.set_yticklabels([LABEL.get(c, c) for c in ctrls], color=INK)
-    ax.set_xlabel("per-episode 99th-percentile planning + control time (ms, log scale); black tick = median of means")
+    ax.set_xlabel("p99 compute time per control step, one dot per episode (ms, log scale)\nblack tick = median of episode means")
     ax.xaxis.grid(True, color=GRID, linewidth=0.8, which="both")
     ax.set_axisbelow(True)
     ax.set_ylim(-0.6, y.max() + 0.9)
-    ax.set_title("Compute latency per control step (CPU, Python)", loc="left", fontsize=11)
+    ax.set_title("Compute latency (CPU, Python)", loc="left", fontsize=11)
     fig.tight_layout()
+    fig.subplots_adjust(right=0.84)
     fig.savefig(path, dpi=160)
     plt.close(fig)
 
@@ -237,6 +246,7 @@ def fig_training(hist, path):
     ax.set_ylabel("validation displacement error (m)")
     ax.yaxis.grid(True, color=GRID, linewidth=0.8)
     ax.set_xlim(1, ep[-1] * 1.45)
+    ax.set_xticks([t for t in range(0, ep[-1] + 1, 10) if t >= 1] + ([ep[-1]] if ep[-1] % 10 else []))
     ax.set_ylim(bottom=0)
     ax.set_title("Trajectory transformer training (held-out episodes, 3 s horizon)", loc="left", fontsize=11)
     fig.tight_layout()
@@ -268,17 +278,18 @@ def main():
     rows = load(args.results)
     present = [c for c in ORDER if any(r["controller"] == c for r in rows)]
     ctrls = args.controllers or present
-    main_ctrls = [c for c in ["lab_mpc", "capsule_nmpc", "hybrid", "expert"] if c in ctrls]
+    main_ctrls = [c for c in ["lab_mpc", "capsule_nmpc", "hybrid", "hybrid_noselector", "expert"] if c in ctrls]
     paired, n_scen = common_scenarios(rows, main_ctrls)
     figdir = os.path.join(args.out, "figures")
     os.makedirs(figdir, exist_ok=True)
     summ = summarize(paired, main_ctrls)
     out = dict(n_scenarios=n_scen, main=summ)
     md = [f"### Main comparison ({n_scen} paired held-out scenarios, CARLA Town02)\n", md_table(summ)]
-    abl = [c for c in ctrls if c.startswith("hybrid_")]
+    abl = [c for c in ctrls if c.startswith("hybrid_") and c != "hybrid_noselector"]
     if abl:
-        ab_rows, n_ab = common_scenarios(rows, ["hybrid"] + abl)
-        s_ab = summarize(ab_rows, ["hybrid"] + abl)
+        base = ["hybrid", "hybrid_noselector"]
+        ab_rows, n_ab = common_scenarios(rows, base + abl)
+        s_ab = summarize(ab_rows, base + abl)
         out["ablation"] = s_ab
         md += [f"\n### Ablations ({n_ab} paired scenarios)\n", md_table(s_ab)]
     tpls, M, N = per_template(paired, main_ctrls)

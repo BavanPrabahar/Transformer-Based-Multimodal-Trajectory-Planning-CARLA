@@ -7,3 +7,5 @@ logs/
 *.npz
 !results/**/*.npz
 checkpoints/*.tmp
+checkpoints/planner_v1*
+checkpoints/planner_v2*

@@ -42,6 +42,12 @@ def make_controller(name, params, args):
             kw.update(safety_halfspaces=False)
         if name == "hybrid_top1":
             kw.update(use_selector=False, safety_halfspaces=False)
+        if name == "hybrid_soft":
+            # revised after the ablation: hard-reject only actual circle overlap (circles are already
+            # ~0.3 m conservative w.r.t. the boxes), trust the model's ranking more, expert-style
+            # dead-lock relaxation; chosen on Town01 validation scenarios, not on Town02
+            from tmpc.planning.selector import SelectorConfig
+            kw.update(selector_cfg=SelectorConfig(min_clearance=0.0, w_prob=2.0), deadlock_relax=True)
         c = HybridController(params, args.model, **kw)
         c.name = name
         return c

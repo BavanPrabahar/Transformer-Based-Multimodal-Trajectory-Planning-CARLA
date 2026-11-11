@@ -79,7 +79,8 @@ class CandidateSelector:
         self._centre = (d_all.reshape(K, nb) ** 2).mean(1)
         return geo, clear, viol, kin_excess, progress
 
-    def select(self, cands_world, logits, obs: Observation) -> Dict:
+    def select(self, cands_world, logits, obs: Observation, relax: float = 0.0) -> Dict:
+        """relax: extra clearance decrease tolerated when the ego is dead-locked (same rule as the expert)."""
         cfg = self.cfg
         e = obs.ego
         K, T, _ = cands_world.shape
@@ -88,7 +89,8 @@ class CandidateSelector:
         c_now = trajectory_clearance(np.array([[e.x]]), np.array([[e.y]]), np.array([[e.yaw]]), np.zeros(1),
                                      obs.agents, self.ego_offs, self.ego_r, ahead_extra=0.0)[0]
         logp = logits - np.log(np.exp(logits - logits.max()).sum()) - logits.max()
-        feas = (geo >= min(cfg.min_clearance, c_now - 0.05)) & (viol.max(1) <= cfg.bound_tol) & (kin < 0.5)
+        feas = (geo >= min(cfg.min_clearance, c_now - 0.05 - relax)) & (viol.max(1) <= cfg.bound_tol) & (kin < 0.5)
+        self.debug = dict(geo=geo, viol=viol.max(1), kin=kin, c_now=c_now, relax=relax, feas=feas)
         v_scale = max(obs.v_des * T * cfg.dt, 1.0)
         J = -cfg.w_prob * logp + cfg.w_clear * np.exp(-np.clip(clear, 0, None) / 0.8) + \
             cfg.w_bound * (viol ** 2).sum(1) * cfg.dt - cfg.w_progress * progress / v_scale + cfg.w_kin * kin + \
@@ -106,7 +108,7 @@ class CandidateSelector:
                 xy = retime(cands_world[i], (e.x, e.y), f * s_orig)
                 r = reference_from_xy(xy, cfg.dt, (e.x, e.y), e.yaw, e.v)[None]
                 g, c, v_, k_, _ = self._evaluate(r, obs)
-                if g[0] >= min(cfg.min_clearance, c_now - 0.05) and v_.max() <= cfg.bound_tol:
+                if g[0] >= min(cfg.min_clearance, c_now - 0.05 - relax) and v_.max() <= cfg.bound_tol:
                     return dict(zref=r[0], mode=int(i), fallback=1, clearance=float(g[0]), n_feasible=0)
         # fallback 2: brake to a stop along the most likely path
         i = int(order[0])

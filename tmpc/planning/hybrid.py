@@ -19,7 +19,8 @@ class HybridController(Controller):
     name = "hybrid"
 
     def __init__(self, params: VehicleParams, model_path: str, device="cpu", use_selector=True,
-                 safety_halfspaces=True, selector_cfg: SelectorConfig = SelectorConfig(), threads=2):
+                 safety_halfspaces=True, selector_cfg: SelectorConfig = SelectorConfig(), threads=2,
+                 deadlock_relax=False):
         torch.set_num_threads(threads)
         self.p = params
         self.device = device
@@ -28,9 +29,11 @@ class HybridController(Controller):
         self.use_selector = use_selector
         self.safety = safety_halfspaces
         self.mpc = LTVMPC(params)
+        self.deadlock_relax = deadlock_relax
 
     def reset(self, route, v_des, ego: EgoState):
         self.u = np.zeros(2)
+        self.stuck = 0.0
 
     @torch.no_grad()
     def predict(self, obs: Observation):
@@ -67,8 +70,10 @@ class HybridController(Controller):
         if obs.ego.v < 0.5:
             world = self.compensate_dead_time(world, (obs.ego.x, obs.ego.y))
         t_nn = time.perf_counter() - t0
+        self.stuck = self.stuck + 0.1 if obs.ego.v < 0.1 else 0.0
+        relax = min(0.4, 0.05 * max(0.0, self.stuck - 2.0)) if self.deadlock_relax else 0.0
         if self.use_selector:
-            sel = self.selector.select(world, logits, obs)
+            sel = self.selector.select(world, logits, obs, relax=relax)
         else:
             from ..controllers.ltv_mpc import reference_from_xy
             i = int(np.argmax(logits))

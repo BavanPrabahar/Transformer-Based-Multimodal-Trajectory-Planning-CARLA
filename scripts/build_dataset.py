@@ -10,6 +10,9 @@ Filtering
 
 Usage: python scripts/build_dataset.py --data data/train --out data/features --stride 2
 """
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")       # one BLAS thread per worker process
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import argparse
 import csv
 import json
